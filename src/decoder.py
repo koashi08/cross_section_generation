@@ -19,6 +19,46 @@ from . import constants as C
 from .encoder_modules import GATv2Stack, _AttnBlock
 
 
+def mask_variable_incident_geometry(edge_index, edge_attr, variable_mask):
+    """可変ノードに接するエッジの幾何量（length, curvature）をゼロ化する。
+
+    edge_type one-hot（構造情報）は保持する。context-context エッジは手つかず。
+    可変-接続エッジの幾何量は可変位置（=ターゲット）を漏らし、生成時にも入手できない
+    ため、デコーダではゼロにする。
+
+    Args:
+        edge_index: [2, E]
+        edge_attr:  [E, EDGE_FEATURE_DIM]
+        variable_mask: [N] bool
+    Returns:
+        masked_edge_attr: [E, EDGE_FEATURE_DIM]（コピー、in-place しない）
+    """
+    if edge_attr.shape[0] == 0:
+        return edge_attr
+    masked = edge_attr.clone()
+    var_incident = variable_mask[edge_index[0]] | variable_mask[edge_index[1]]  # [E] bool
+    for col in C.EDGE_GEOM_COLS:
+        masked[var_incident, col] = 0.0
+    return masked
+
+
+def mask_variable_position(x_var):
+    """可変ノードの特徴量から、位置を漏らす列をゼロ化する。
+
+    可変ノードの位置（r, sin, cos, x, y）と隣接エッジ長平均は予測対象（ターゲット）を
+    漏らすため、slot 初期化ではゼロにする。type one-hot・隣接エッジ数（トポロジ）は保持。
+    これにより、デコーダは可変位置を z と context からのみ復元するようになる。
+
+    Args:
+        x_var: [N_var, NODE_FEATURE_DIM]
+    Returns:
+        masked: [N_var, NODE_FEATURE_DIM]（コピー、in-place しない）
+    """
+    masked = x_var.clone()
+    masked[:, C.NODE_POS_LEAK_COLS] = 0.0
+    return masked
+
+
 class OutputHead(nn.Module):
     """可変ノード埋め込み -> 2D 座標（or オフセット）。"""
 
@@ -123,7 +163,9 @@ class Decoder(nn.Module):
         h_ctx = self.context_gnn(h_ctx, ctx_ei, ctx_ea)
 
         # (3) Slot 初期化（z 注入）
-        x_var = data.x[var_nodes]
+        #     可変ノードの位置列はマスク（ターゲット漏れ防止）。type・隣接数は保持。
+        #     位置は z_var/z_global と context から復元させる。
+        x_var = mask_variable_position(data.x[var_nodes])
         b_var = batch[var_nodes]
         slot_h = self.slot_init(
             torch.cat([x_var, z_global[b_var], z_var[b_var]], dim=-1))
@@ -138,10 +180,14 @@ class Decoder(nn.Module):
         slot_h = x[sm]                          # dense -> sparse
 
         # (6) 全グラフ DecoderGNN
+        #     可変-接続エッジの幾何量（length, curvature）はマスク（ターゲット漏れ防止）。
+        #     edge_type は保持。context-context エッジは手つかず。
+        dec_edge_attr = mask_variable_incident_geometry(
+            data.edge_index, data.edge_attr, var_mask)
         h_full = torch.zeros(N, slot_h.size(-1), device=device)
         h_full[ctx_nodes] = h_ctx
         h_full[var_nodes] = slot_h
-        h_full = self.decoder_gnn(h_full, data.edge_index, data.edge_attr)
+        h_full = self.decoder_gnn(h_full, data.edge_index, dec_edge_attr)
 
         # (7) OutputHead
         anchor_var = data.anchor[var_nodes]

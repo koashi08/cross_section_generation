@@ -47,3 +47,14 @@ EDGE_FEATURE_DIM = 2 + NUM_EDGE_TYPES           # = 4
 NODE_NORM_COLS = [4, 7, 8, 9, 10]    # type(0-3), r(4), sin(5), cos(6), x(7), y(8), len(9), cnt(10)
 # edge_attr の標準化対象: edge_length_norm, kappa_abs_mean_norm
 EDGE_NORM_COLS = [0, 1]
+
+# ---- edge_attr の幾何量列（デコーダで可変-接続エッジをマスクする対象）----
+# index 0=edge_length_norm, 1=kappa_abs_mean_norm が幾何量（実現形状に依存）。
+# index 2-3=edge_type one-hot は構造情報なのでマスクしない。
+EDGE_GEOM_COLS = [0, 1]
+
+# ---- ノード特徴量 x のうち、可変ノードの位置を漏らす列（デコーダ slot 初期化でマスク）----
+# レイアウト: [type(0-3), r(4), sin(5), cos(6), x(7), y(8), inc_len_mean(9), inc_cnt(10)]
+# マスク対象: r, sin, cos, x, y（直接の位置）と inc_len_mean（隣接エッジ長→可変位置に依存）。
+# 非マスク: type one-hot（タイプ情報）, inc_cnt（隣接エッジ数＝トポロジ、位置非依存）。
+NODE_POS_LEAK_COLS = [4, 5, 6, 7, 8, 9]
