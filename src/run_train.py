@@ -1,23 +1,23 @@
-"""断面形状 VAE の学習エントリーポイント（組み立てスクリプト）。
+"""断面形状 VAE の学習エントリーポイント（YAML 設定対応）。
 
 使い方:
-    python run_train.py
-
-設定は下記の CONFIG セクションを編集する。実データ投入時は RAW_DIR を
-実データの CSV ディレクトリに向け、必要なら parser.py の
-NODE_TYPE_CODE_MAP / EDGE_TYPE_CODE_MAP を実コードに合わせること。
+    python run_train.py --config configs/default.yaml
+    python run_train.py --config configs/exp_001.yaml --epochs 5   # 一部上書き
 
 処理の流れ:
-    1. 実データスキーマの事前チェック（切り捨て・型コード）
-    2. データ準備（分割 -> 正規化 fit -> 変換 -> 保存）
-    3. モデル構築
-    4. 学習（Trainer）
-    5. best モデルでテスト評価
-    6. 生成サンプルの可視化（任意）
+    1. 設定読み込み（YAML）
+    2. 実データスキーマの事前チェック（切り捨て・型コード）
+    3. データ準備（分割 -> 正規化 fit -> 変換 -> 保存）
+    4. モデル構築
+    5. 学習（Trainer）
+    6. best モデルでテスト評価
+    7. 生成サンプルの可視化（任意）
+    8. 使用した設定を出力先に保存（再現性）
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 
 import matplotlib
@@ -28,59 +28,19 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from cross_section import constants as C
+from cross_section.config import (
+    load_config, to_train_config, model_kwargs_from, save_config,
+)
 from cross_section.dataset import prepare_datasets
 from cross_section.vae import CrossSectionVAE
-from cross_section.train import Trainer, TrainConfig
+from cross_section.train import Trainer
 from cross_section.metrics import reconstruction_metrics
 
 
 # ==========================================================================
-# CONFIG（ここを編集）
+# Step 2: 実データスキーマの事前チェック
 # ==========================================================================
-# --- パス ---
-RAW_DIR = "./data_raw"               # nodes.csv, edges.csv, graphs.csv がある場所
-PROCESSED_ROOT = "./data_processed"  # InMemoryDataset / 統計 / 分割の保存先
-CHECKPOINT_DIR = "./checkpoints"     # モデル・履歴の保存先
-
-# --- データ ---
-SPLIT_RATIOS = (0.95, 0.04, 0.01)
-SEED = 0
-ANCHOR_MODE = "zero"                 # "zero"=直接予測（当面）
-
-# --- ノード数上限（実データ最大 8/14 に余裕 +2）---
-MAX_VAR_NODES = 10
-MAX_CONTEXT_NODES = 16
-
-# --- モデル ---
-HIDDEN_DIM = 64
-Z_GLOBAL_DIM = 8
-Z_VAR_DIM = 16
-Z_FIXED_DIM = 8
-NUM_HEADS = 4
-DROPOUT = 0.1
-USE_ANCHOR = False                   # 直接予測（当面）
-
-# --- 学習 ---
-EPOCHS = 100
-LR = 1e-3
-BATCH_SIZE = 64
-WARMUP_EPOCHS = 10
-BETA_GLOBAL_MAX = 1.0
-BETA_VAR_MAX = 1.0
-FREE_BITS = 0.5                      # posterior collapse 対策（必要に応じて 0 に）
-GRAD_CLIP = 1.0
-PATIENCE = 15
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# --- 可視化 ---
-VISUALIZE_SAMPLES = True
-N_VIS_SAMPLES = 8
-
-
-# ==========================================================================
-# Step 1: 実データスキーマの事前チェック
-# ==========================================================================
-def precheck_schema(raw_dir):
+def precheck_schema(raw_dir, max_var_nodes, max_context_nodes):
     """切り捨て・型コードの事前チェック。問題があれば早期に気づけるようにする。"""
     print("=" * 64)
     print("【事前チェック】実データスキーマ")
@@ -127,42 +87,38 @@ def precheck_schema(raw_dir):
     var_max = counts[counts.node_type_code == var_code].n.max()
     ctx_max = (counts[counts.node_type_code != var_code]
                .groupby("graph_id").n.sum().max())
-    print(f"可変ノード最大: {var_max} (上限 {MAX_VAR_NODES})")
-    print(f"context ノード最大: {ctx_max} (上限 {MAX_CONTEXT_NODES})")
+    print(f"可変ノード最大: {var_max} (上限 {max_var_nodes})")
+    print(f"context ノード最大: {ctx_max} (上限 {max_context_nodes})")
 
-    if var_max > MAX_VAR_NODES:
+    if var_max > max_var_nodes:
         raise ValueError(
-            f"可変ノード最大 {var_max} が MAX_VAR_NODES={MAX_VAR_NODES} を超過。"
-            f" to_dense_batch で切り捨てが起きます。MAX_VAR_NODES を上げてください。")
-    if ctx_max > MAX_CONTEXT_NODES:
+            f"可変ノード最大 {var_max} が max_var_nodes={max_var_nodes} を超過。"
+            f" to_dense_batch で切り捨てが起きます。model.max_var_nodes を上げてください。")
+    if ctx_max > max_context_nodes:
         raise ValueError(
-            f"context ノード最大 {ctx_max} が MAX_CONTEXT_NODES={MAX_CONTEXT_NODES} を超過。"
-            f" MAX_CONTEXT_NODES を上げてください。")
+            f"context ノード最大 {ctx_max} が max_context_nodes={max_context_nodes} を超過。"
+            f" model.max_context_nodes を上げてください。")
     print("✓ ノード数上限内（切り捨てなし）")
 
-    # --- kappa スケールの目安を表示（無次元化の確認用）---
+    # --- kappa スケールの目安 ---
     kappa = edges_df["kappa_abs_mean"]
     print(f"kappa_abs_mean: min={kappa.min():.4g}, "
           f"max={kappa.max():.4g}, mean={kappa.mean():.4g}")
-    print("  ※ 生の曲率(1/length)想定で conversion.py が × l_ref している。")
-    print("    値が極端な場合はスケール調整を検討。")
-
     print(f"\nサンプル数: {graphs_df['graph_id'].nunique()}")
     return True
 
 
 # ==========================================================================
-# Step 5: テスト評価
+# Step 6: テスト評価
 # ==========================================================================
 @torch.no_grad()
-def evaluate_test(model, test_ds, normalizer, device):
+def evaluate_test(model, test_ds, normalizer, device, batch_size):
     print("\n" + "=" * 64)
     print("【テスト評価】best モデル")
     print("=" * 64)
     model.eval()
-    loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     agg = {"euclid": 0.0, "mse": 0.0, "n": 0}
-    # 極値数別の誤差も集計
     per_ext = {}
     for batch in loader:
         batch = batch.to(device)
@@ -172,10 +128,8 @@ def evaluate_test(model, test_ds, normalizer, device):
         agg["euclid"] += m["mean_euclidean"] * bs
         agg["mse"] += m["mse_real"] * bs
         agg["n"] += bs
-        # 極値数別（バッチ内で集計）
         for ext in batch.extremum_count.view(-1).tolist():
-            per_ext.setdefault(ext, 0)
-            per_ext[ext] += 1
+            per_ext[ext] = per_ext.get(ext, 0) + 1
 
     n = max(agg["n"], 1)
     print(f"テスト 実スケール平均ユークリッド誤差: {agg['euclid'] / n:.4f}")
@@ -185,24 +139,22 @@ def evaluate_test(model, test_ds, normalizer, device):
 
 
 # ==========================================================================
-# Step 6: 生成サンプルの可視化
+# Step 7: 生成サンプルの可視化
 # ==========================================================================
 @torch.no_grad()
 def visualize_reconstructions(model, test_ds, normalizer, device, n_samples, savepath):
-    """再構成（μ を使った決定論的予測）と元形状を比較描画。"""
     import matplotlib.pyplot as plt
-    from cross_section import geometry as G
 
     model.eval()
     samples = [test_ds[i] for i in range(min(n_samples, len(test_ds)))]
-    loader = DataLoader(samples, batch_size=len(samples), shuffle=False)
-    batch = next(iter(loader)).to(device)
+    batch = next(iter(DataLoader(samples, batch_size=len(samples), shuffle=False))).to(device)
 
     out = model(batch)
-    pred = out["pred_pos"].cpu().numpy()      # [N_var, 2]（正規化座標）
+    pred = out["pred_pos"].cpu().numpy()
     var_nodes = out["var_nodes"].cpu().numpy()
     b = batch.batch.cpu().numpy()
-    l_ref = batch.l_ref.view(-1).cpu().numpy()
+    cart = batch.pos_cart.cpu().numpy()
+    ntype = batch.node_type.cpu().numpy()
 
     ncols = 4
     nrows = (len(samples) + ncols - 1) // ncols
@@ -211,12 +163,7 @@ def visualize_reconstructions(model, test_ds, normalizer, device, n_samples, sav
 
     for si in range(len(samples)):
         ax = axes[si]
-        node_mask = (b == si)
-        # 元形状（全ノード、正規化座標 x/l_ref, y/l_ref を pos_cart に持っている）
-        cart = batch.pos_cart.cpu().numpy()
-        ntype = batch.node_type.cpu().numpy()
-        idx = np.where(node_mask)[0]
-        # context と可変を色分け
+        idx = np.where(b == si)[0]
         for t, color in [(C.NODE_TYPE["fixed"], "#1f77b4"),
                          (C.NODE_TYPE["variable"], "#d62728"),
                          (C.NODE_TYPE["extension"], "#2ca02c"),
@@ -224,8 +171,8 @@ def visualize_reconstructions(model, test_ds, normalizer, device, n_samples, sav
             sel = idx[ntype[idx] == t]
             if sel.size:
                 ax.scatter(cart[sel, 0], cart[sel, 1], c=color, s=40,
-                           label=C.NODE_TYPE_INV[t], zorder=3, edgecolors="white", linewidths=0.5)
-        # 予測（可変ノードのみ）
+                           label=C.NODE_TYPE_INV[t], zorder=3,
+                           edgecolors="white", linewidths=0.5)
         var_in_sample = [j for j, vn in enumerate(var_nodes) if b[vn] == si]
         if var_in_sample:
             pv = pred[var_in_sample]
@@ -235,7 +182,6 @@ def visualize_reconstructions(model, test_ds, normalizer, device, n_samples, sav
         ax.set_title(f"sample {si} (ext={int(batch.extremum_count[si])})", fontsize=9)
         ax.legend(fontsize=6, loc="upper right")
         ax.grid(alpha=0.2)
-
     for j in range(len(samples), len(axes)):
         axes[j].axis("off")
     fig.tight_layout()
@@ -246,77 +192,97 @@ def visualize_reconstructions(model, test_ds, normalizer, device, n_samples, sav
 # ==========================================================================
 # main
 # ==========================================================================
+def parse_args():
+    p = argparse.ArgumentParser(description="断面形状 VAE の学習")
+    p.add_argument("--config", type=str, default="configs/default.yaml",
+                   help="YAML 設定ファイルのパス")
+    # よく上書きする項目だけ CLI でも受ける（任意）
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--raw-dir", type=str, default=None)
+    p.add_argument("--device", type=str, default=None)
+    return p.parse_args()
+
+
+def build_overrides(args) -> dict:
+    """CLI 引数を YAML 上書き用の dict に変換（指定されたものだけ）。"""
+    ov = {}
+    if args.epochs is not None:
+        ov.setdefault("training", {})["epochs"] = args.epochs
+    if args.device is not None:
+        ov.setdefault("training", {})["device"] = args.device
+    if args.raw_dir is not None:
+        ov.setdefault("paths", {})["raw_dir"] = args.raw_dir
+    return ov
+
+
 def main():
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+    args = parse_args()
 
-    # Step 1: 事前チェック
-    precheck_schema(RAW_DIR)
+    # Step 1: 設定読み込み
+    cfg = load_config(args.config, overrides=build_overrides(args))
+    seed = cfg["data"]["seed"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    # Step 2: データ準備
+    train_cfg = to_train_config(cfg)
+    model_kwargs = model_kwargs_from(cfg)
+    paths = cfg["paths"]
+
+    print(f"設定ファイル: {args.config}")
+    print(f"device: {train_cfg.device}")
+
+    # Step 2: 事前チェック
+    precheck_schema(paths["raw_dir"],
+                    model_kwargs["max_var_nodes"],
+                    model_kwargs["max_context_nodes"])
+
+    # Step 3: データ準備
     print("\n" + "=" * 64)
     print("【データ準備】")
     print("=" * 64)
     train_ds, val_ds, test_ds, normalizer = prepare_datasets(
-        raw_dir=RAW_DIR,
-        processed_root=PROCESSED_ROOT,
-        ratios=SPLIT_RATIOS,
-        seed=SEED,
-        anchor_mode=ANCHOR_MODE,
+        raw_dir=paths["raw_dir"],
+        processed_root=paths["processed_root"],
+        ratios=tuple(cfg["data"]["ratios"]),
+        seed=seed,
+        anchor_mode=cfg["data"]["anchor_mode"],
     )
 
-    # Step 3: モデル構築
+    # Step 4: モデル構築
     print("\n" + "=" * 64)
     print("【モデル構築】")
     print("=" * 64)
-    model = CrossSectionVAE(
-        in_dim=C.NODE_FEATURE_DIM,
-        hidden_dim=HIDDEN_DIM,
-        z_global_dim=Z_GLOBAL_DIM,
-        z_var_dim=Z_VAR_DIM,
-        z_fixed_dim=Z_FIXED_DIM,
-        edge_dim=C.EDGE_FEATURE_DIM,
-        num_heads=NUM_HEADS,
-        dropout=DROPOUT,
-        max_var_nodes=MAX_VAR_NODES,
-        max_context_nodes=MAX_CONTEXT_NODES,
-        use_anchor=USE_ANCHOR,
-    )
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"パラメータ数: {n_params:,}")
-    print(f"device: {DEVICE}")
+    model = CrossSectionVAE(**model_kwargs)
+    print(f"パラメータ数: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Step 4: 学習
+    # Step 5: 学習
     print("\n" + "=" * 64)
     print("【学習】")
     print("=" * 64)
-    config = TrainConfig(
-        epochs=EPOCHS, lr=LR, batch_size=BATCH_SIZE,
-        warmup_epochs=WARMUP_EPOCHS,
-        beta_global_max=BETA_GLOBAL_MAX, beta_var_max=BETA_VAR_MAX,
-        free_bits=FREE_BITS, grad_clip=GRAD_CLIP, patience=PATIENCE,
-        checkpoint_dir=CHECKPOINT_DIR, device=DEVICE, log_every=1,
-    )
-    trainer = Trainer(model, train_ds, val_ds, normalizer, config)
+    trainer = Trainer(model, train_ds, val_ds, normalizer, train_cfg)
     trainer.train()
 
-    # Step 5: best モデルでテスト評価
+    # Step 6: テスト評価
     trainer.load_best()
-    evaluate_test(model, test_ds, normalizer, DEVICE)
+    evaluate_test(model, test_ds, normalizer, train_cfg.device, train_cfg.batch_size)
 
-    # Step 6: 生成サンプルの可視化
-    if VISUALIZE_SAMPLES:
+    # Step 7: 可視化
+    if cfg.get("misc", {}).get("visualize_samples", False):
         print("\n" + "=" * 64)
         print("【再構成の可視化】")
         print("=" * 64)
         visualize_reconstructions(
-            model, test_ds, normalizer, DEVICE, N_VIS_SAMPLES,
-            os.path.join(CHECKPOINT_DIR, "reconstructions.png"))
+            model, test_ds, normalizer, train_cfg.device,
+            cfg["misc"].get("n_vis_samples", 8),
+            os.path.join(paths["checkpoint_dir"], "reconstructions.png"))
 
+    # Step 8: 使用した設定を保存（再現性）
+    save_config(cfg, os.path.join(paths["checkpoint_dir"], "config_used.yaml"))
     print("\n" + "=" * 64)
     print("完了 ✓")
-    print(f"  チェックポイント: {os.path.join(CHECKPOINT_DIR, 'best.pt')}")
-    print(f"  学習履歴: {os.path.join(CHECKPOINT_DIR, 'history.csv')}")
+    print(f"  チェックポイント: {os.path.join(paths['checkpoint_dir'], 'best.pt')}")
+    print(f"  学習履歴: {os.path.join(paths['checkpoint_dir'], 'history.csv')}")
+    print(f"  使用設定: {os.path.join(paths['checkpoint_dir'], 'config_used.yaml')}")
     print("=" * 64)
 
 

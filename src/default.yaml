@@ -1,0 +1,47 @@
+# ==========================================================================
+# 断面形状 VAE - デフォルト設定
+# ==========================================================================
+# 実験ごとにこのファイルをコピーして編集し、再現性を確保する。
+# 実データ投入時は paths.raw_dir を実データの CSV ディレクトリに向ける。
+
+paths:
+  raw_dir: ./data/raw                 # nodes.csv, edges.csv, graphs.csv がある場所
+  processed_root: ./data/processed    # InMemoryDataset / 統計 / 分割の保存先
+  checkpoint_dir: ./outputs/exp_default  # モデル・履歴・可視化の保存先
+
+data:
+  ratios: [0.95, 0.04, 0.01]          # train : val : test
+  seed: 0
+  anchor_mode: zero                   # zero=直接予測（当面）, context_mean, design_space（将来）
+
+model:
+  hidden_dim: 64
+  z_global_dim: 8
+  z_var_dim: 16
+  z_fixed_dim: 8
+  num_heads: 4                        # hidden_dim はこれで割り切れる必要あり
+  dropout: 0.1
+  max_var_nodes: 10                   # 実データ最大 8 に余裕 +2
+  max_context_nodes: 16               # 実データ最大 14 に余裕 +2
+  use_anchor: false                   # 直接予測（当面）
+
+training:
+  epochs: 100
+  lr: 0.001
+  batch_size: 64
+  warmup_epochs: 10                   # β を 0 -> max に上げる期間
+  beta_global_max: 1.0
+  beta_var_max: 1.0
+  free_bits: 0.5                      # posterior collapse 対策（次元あたり nats）。0 で無効
+  grad_clip: 1.0
+  patience: 15                        # early stopping
+  use_scheduler: true
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+  min_lr: 1.0e-6
+  device: auto                        # auto=GPU があれば cuda, なければ cpu
+  log_every: 1
+
+misc:
+  visualize_samples: true
+  n_vis_samples: 8
