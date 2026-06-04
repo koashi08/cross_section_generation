@@ -35,6 +35,7 @@ from cross_section.dataset import prepare_datasets
 from cross_section.vae import CrossSectionVAE
 from cross_section.train import Trainer
 from cross_section.metrics import reconstruction_metrics
+from cross_section.export import export_predictions
 
 
 # ==========================================================================
@@ -266,6 +267,13 @@ def main():
     trainer.load_best()
     evaluate_test(model, test_ds, normalizer, train_cfg.device, train_cfg.batch_size)
 
+    # Step 6b: テストセットの予測結果を CSV 出力
+    pred_csv = os.path.join(paths["checkpoint_dir"], "predictions_test.csv")
+    export_predictions(model, test_ds, pred_csv, device=train_cfg.device,
+                       normalizer=normalizer, batch_size=train_cfg.batch_size,
+                       mode="reconstruct")
+    print(f"✓ テスト予測結果を {pred_csv} に保存")
+
     # Step 7: 可視化
     if cfg.get("misc", {}).get("visualize_samples", False):
         print("\n" + "=" * 64)
@@ -282,6 +290,7 @@ def main():
     print("完了 ✓")
     print(f"  チェックポイント: {os.path.join(paths['checkpoint_dir'], 'best.pt')}")
     print(f"  学習履歴: {os.path.join(paths['checkpoint_dir'], 'history.csv')}")
+    print(f"  予測結果: {os.path.join(paths['checkpoint_dir'], 'predictions_test.csv')}")
     print(f"  使用設定: {os.path.join(paths['checkpoint_dir'], 'config_used.yaml')}")
     print("=" * 64)
 
