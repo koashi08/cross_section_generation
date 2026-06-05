@@ -116,12 +116,17 @@ class Decoder(nn.Module):
         # (b) Context GNN
         self.context_gnn = GATv2Stack(hidden_dim, context_gnn_layers, num_heads, edge_dim, dropout)
 
-        # (c) Slot 初期化（in_dim(=可変ノードの x) + z_global + z_var）
-        #     ※ x にノード位置が含まれるが、可変ノードの位置は予測対象なので
-        #        ここでは x のうち位置以外の情報（タイプ等）を活かす設計。
-        #        ただし直接予測では位置情報を使わないため、x をそのまま渡してもよい。
+        # (c) Slot 初期化
+        #     可変ノードの位置列はマスクするため（mask_variable_position）、
+        #     対称な中間ノード（v3,v4 等）を区別する識別子を slot_id から注入する。
+        #     一筆書き順 slot_id -> extremum_index(=slot_id//2), left_right(=slot_id%2)。
+        self.slot_id_embed = nn.Embedding(C.MAX_SLOTS, C.SLOT_ID_EMBED_DIM)
+        self.extremum_embed = nn.Embedding(C.MAX_EXTREMA, C.EXTREMUM_EMBED_DIM)
+        self.left_right_embed = nn.Embedding(2, C.LEFT_RIGHT_EMBED_DIM)
+        slot_id_total = (C.SLOT_ID_EMBED_DIM + C.EXTREMUM_EMBED_DIM
+                         + C.LEFT_RIGHT_EMBED_DIM)
         self.slot_init = nn.Sequential(
-            nn.Linear(in_dim + z_global_dim + z_var_dim, hidden_dim),
+            nn.Linear(in_dim + slot_id_total + z_global_dim + z_var_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -137,7 +142,7 @@ class Decoder(nn.Module):
         # (g) OutputHead
         self.out_head = OutputHead(hidden_dim, use_anchor=use_anchor, dropout=dropout)
 
-    def forward(self, data, z_global, z_var, z_fixed, context_info=None, batch_size=None):
+    def forward(self, data, z_global, z_var, z_fixed, batch_size=None):
         device = data.x.device
         N = data.x.size(0)
         batch = data.batch if hasattr(data, "batch") and data.batch is not None \
@@ -162,13 +167,26 @@ class Decoder(nn.Module):
             relabel_nodes=True, num_nodes=N)
         h_ctx = self.context_gnn(h_ctx, ctx_ei, ctx_ea)
 
-        # (3) Slot 初期化（z 注入）
+        # (3) Slot 初期化（z + スロット識別子 注入）
         #     可変ノードの位置列はマスク（ターゲット漏れ防止）。type・隣接数は保持。
         #     位置は z_var/z_global と context から復元させる。
+        #     対称な中間ノードを区別するため、一筆書き順 slot_id から
+        #     slot_id / extremum_index(=slot_id//2) / left_right(=slot_id%2) を embedding 注入。
         x_var = mask_variable_position(data.x[var_nodes])
         b_var = batch[var_nodes]
+
+        slot_id = data.slot_id[var_nodes].clamp(min=0)        # context は -1 だが var のみ抽出済
+        slot_id = slot_id.clamp(max=C.MAX_SLOTS - 1)          # 安全側クランプ
+        extremum_idx = (slot_id // 2).clamp(max=C.MAX_EXTREMA - 1)
+        left_right = (slot_id % 2)
+        slot_id_emb = torch.cat([
+            self.slot_id_embed(slot_id),
+            self.extremum_embed(extremum_idx),
+            self.left_right_embed(left_right),
+        ], dim=-1)
+
         slot_h = self.slot_init(
-            torch.cat([x_var, z_global[b_var], z_var[b_var]], dim=-1))
+            torch.cat([x_var, slot_id_emb, z_global[b_var], z_var[b_var]], dim=-1))
 
         # (4) Slot Self-Att
         sd, sm = to_dense_batch(slot_h, b_var, max_num_nodes=self.max_var_nodes, batch_size=batch_size)

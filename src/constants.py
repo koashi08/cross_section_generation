@@ -58,3 +58,14 @@ EDGE_GEOM_COLS = [0, 1]
 # マスク対象: r, sin, cos, x, y（直接の位置）と inc_len_mean（隣接エッジ長→可変位置に依存）。
 # 非マスク: type one-hot（タイプ情報）, inc_cnt（隣接エッジ数＝トポロジ、位置非依存）。
 NODE_POS_LEAK_COLS = [4, 5, 6, 7, 8, 9]
+
+# ---- スロット識別子（デコーダ slot 初期化に注入）----
+# 一筆書き順の可変ノード通し番号 slot_id から以下を導出:
+#   extremum_index = slot_id // 2   （どの極値ペアか）
+#   left_right     = slot_id %  2   （ペアの左/右）
+# 極値数は最大4なので、極値ペアは最大4。slot_id は最大 8（極値4×2点）。
+MAX_EXTREMA = 4                      # 極値ペアの最大数（extremum_index の上限）
+MAX_SLOTS = MAX_EXTREMA * 2          # slot_id の最大数（= max_var_nodes と整合）
+SLOT_ID_EMBED_DIM = 8                # slot_id embedding の次元
+EXTREMUM_EMBED_DIM = 4               # extremum_index embedding の次元
+LEFT_RIGHT_EMBED_DIM = 2             # left_right embedding の次元

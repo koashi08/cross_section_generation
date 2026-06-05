@@ -156,6 +156,14 @@ def build_data(sample: RawSample, anchor_mode: str = "zero") -> Data:
     x = _build_node_features(sample, xy, l_ref, edge_index, edge_lengths)
     variable_mask = (node_types == C.VAR_ID)
 
+    # slot_id: 可変ノードに一筆書き順（node_id 順）の通し番号を振る。
+    # RawSample.nodes は parser で node_id 順にソート済みなので、
+    # variable_mask の昇順インデックスがそのまま一筆書きの可変順序になる。
+    # context ノードは -1（未使用を表す）。
+    slot_id = np.full(n, -1, dtype=np.int64)
+    var_idx = np.where(variable_mask)[0]        # 昇順 = 一筆書き順
+    slot_id[var_idx] = np.arange(len(var_idx))  # 0,1,2,... と採番
+
     # anchor / target は Cartesian（ユーザー方針 (a)）
     # 当面は anchor_mode="zero"（直接予測）。設計空間判明後に切替予定。
     anchor = _compute_anchor(xy, node_types, edge_index, anchor_mode)
@@ -173,6 +181,7 @@ def build_data(sample: RawSample, anchor_mode: str = "zero") -> Data:
         variable_mask=torch.from_numpy(variable_mask),
         anchor=torch.from_numpy(anchor.astype(np.float32)),   # Cartesian（zero モードでは全ゼロ）
         y=torch.from_numpy(y.astype(np.float32)),             # Cartesian
+        slot_id=torch.from_numpy(slot_id),                    # 一筆書き順の可変通し番号（context は -1）
     )
     data.graph_id = torch.tensor([sample.graph_id], dtype=torch.long)
     data.extremum_count = torch.tensor([sample.extremum_count], dtype=torch.long)
