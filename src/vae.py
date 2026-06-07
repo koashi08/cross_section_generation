@@ -65,7 +65,6 @@ class CrossSectionVAE(nn.Module):
             z_global=enc["z_global"],
             z_var=enc["z_var"],
             z_fixed=enc["z_fixed"],
-            context_info=enc["context_info"],
             batch_size=enc["batch_size"],
         )
         return {**enc, **dec}
@@ -75,7 +74,7 @@ class CrossSectionVAE(nn.Module):
         """推論: z をサンプリング（or 指定）して可変ノードを生成する。
         z_fixed は context から決定論的に計算する。"""
         self.eval()
-        enc = self.encoder(data)          # z_fixed と context_info を得るため
+        enc = self.encoder(data)          # z_fixed を得るため
         bs = enc["batch_size"]
         device = data.x.device
         if z_global is None:
@@ -84,7 +83,7 @@ class CrossSectionVAE(nn.Module):
             z_var = torch.randn(bs, enc["mu_var"].size(-1), device=device)
         dec = self.decoder(
             data, z_global=z_global, z_var=z_var, z_fixed=enc["z_fixed"],
-            context_info=enc["context_info"], batch_size=bs)
+            batch_size=bs)
         return dec
 
 
@@ -94,11 +93,15 @@ def vae_loss(
     normalizer=None,
     beta_global: float = 1.0,
     beta_var: float = 1.0,
+    free_bits: float = 0.0,
 ):
     """VAE 損失。
 
     再構成損失は Cartesian。normalizer があれば標準化空間で MSE を取る
     （出力ヘッドの学習安定化）。z_fixed は決定論なので KL 対象外。
+
+    free_bits > 0 のとき、各潜在次元あたり free_bits nats までは KL にペナルティを
+    課さない（posterior collapse 対策）。次元ごとに max(kl_dim, free_bits) を取る。
     """
     var_nodes = outputs["var_nodes"]
     pred_pos = outputs["pred_pos"]                 # [N_var, 2]
@@ -115,8 +118,18 @@ def vae_loss(
 
     mu_g, lv_g = outputs["mu_global"], outputs["logvar_global"]
     mu_v, lv_v = outputs["mu_var"], outputs["logvar_var"]
-    kl_g = -0.5 * torch.mean(1 + lv_g - mu_g.pow(2) - lv_g.exp())
-    kl_v = -0.5 * torch.mean(1 + lv_v - mu_v.pow(2) - lv_v.exp())
+
+    # 次元ごとの KL（バッチ平均）
+    kl_g_dim = -0.5 * (1 + lv_g - mu_g.pow(2) - lv_g.exp()).mean(0)   # [z_global_dim]
+    kl_v_dim = -0.5 * (1 + lv_v - mu_v.pow(2) - lv_v.exp()).mean(0)   # [z_var_dim]
+
+    if free_bits > 0:
+        # 各次元 free_bits nats まではペナルティ免除
+        kl_g = torch.clamp(kl_g_dim, min=free_bits).sum()
+        kl_v = torch.clamp(kl_v_dim, min=free_bits).sum()
+    else:
+        kl_g = kl_g_dim.sum()
+        kl_v = kl_v_dim.sum()
 
     total = recon + beta_global * kl_g + beta_var * kl_v
     return total, {
